@@ -120,6 +120,7 @@ impl EventFormatter {
             }
         }
 
+        map.end()?;
         Ok(())
     }
 }
