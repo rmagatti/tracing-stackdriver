@@ -96,7 +96,7 @@ impl Visit for EventFieldVisitor<'_> {
             // Skip fields that are actually log metadata that have already been handled
             name if name.starts_with("log.") => (),
             name if name.starts_with("event.") => (),
-            name if name == "message" => {
+            "message" => {
                 self.0.insert(
                     "message".to_string(), // Use "message" as the key for the message field
                     serde_json::Value::String(format!("{:?}", value)),
