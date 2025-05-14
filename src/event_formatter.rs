@@ -1,7 +1,6 @@
 use crate::{
     google::LogSeverity,
     serializers::{SerializableContext, SerializableSpan, SourceLocation},
-    visitor::Visitor,
     writer::WriteAdaptor,
 };
 use serde::ser::{SerializeMap, Serializer as _};
@@ -9,7 +8,6 @@ use std::fmt;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tracing_core::{Event, Subscriber};
 use tracing_subscriber::{
-    field::VisitOutput,
     fmt::{
         format::{self, JsonFields},
         FmtContext, FormatEvent,
@@ -92,39 +90,36 @@ impl EventFormatter {
                 span.extensions().get::<tracing_opentelemetry::OtelData>(),
             ) {
                 use opentelemetry::trace::TraceContextExt;
+                #[cfg(feature = "opentelemetry")]
+                if let Some(config) = self.cloud_trace_configuration.as_ref() {
+                    let project_id = &config.project_id;
+                    // Get the OpenTelemetry context associated with the current tracing span
+                    let otel_ctx = opentelemetry::Context::current();
 
-                let builder = &otel_data.builder;
+                    // Check if this OpenTelemetry context has an active span
+                    // TraceContextExt must be in scope for otel_ctx.has_active_span() and otel_ctx.span()
+                    if otel_ctx.has_active_span() {
+                        let otel_span_ref = otel_ctx.span();
+                        let otel_span_context = otel_span_ref.span_context();
 
-                if let Some(span_id) = builder.span_id {
-                    map.serialize_entry("logging.googleapis.com/spanId", &span_id.to_string())?;
-                }
+                        let span_id = otel_span_context.span_id();
+                        let trace_id = otel_span_context.trace_id();
+                        let is_sampled = otel_span_context.is_sampled();
 
-                let (trace_id, trace_sampled) = if otel_data.parent_cx.has_active_span() {
-                    let span_ref = otel_data.parent_cx.span();
-                    let span_context = span_ref.span_context();
+                        map.serialize_entry("logging.googleapis.com/spanId", &span_id.to_string())?;
+                        map.serialize_entry(
+                            "logging.googleapis.com/trace",
+                            &format!("projects/{}/traces/{}", project_id, trace_id),
+                        )?;
 
-                    (Some(span_context.trace_id()), span_context.is_sampled())
-                } else {
-                    (builder.trace_id, false)
-                };
-
-                if let Some(trace_id) = trace_id {
-                    map.serialize_entry(
-                        "logging.googleapis.com/trace",
-                        &format!("projects/{project_id}/traces/{trace_id}",),
-                    )?;
-                }
-
-                if trace_sampled {
-                    map.serialize_entry("logging.googleapis.com/trace_sampled", &true)?;
+                        if is_sampled {
+                            map.serialize_entry("logging.googleapis.com/trace_sampled", &true)?;
+                        }
+                    }
                 }
             }
         }
 
-        // serialize the stackdriver-specific fields with a visitor
-        let mut visitor = Visitor::new(severity, map);
-        event.record(&mut visitor);
-        visitor.finish().map_err(Error::from)?;
         Ok(())
     }
 }
