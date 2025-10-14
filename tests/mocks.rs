@@ -22,16 +22,61 @@ pub struct MockDefaultEvent {
     pub insert_id: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct MockSpan {
-    pub name: String,
+    #[serde(rename = "name", alias = "spanName")]
+    #[allow(clippy::disallowed_names)]
+    pub span_name: String,
+    #[serde(default)]
     pub foo: String,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(try_from = "MockEventHelper")]
 pub struct MockEventWithSpan {
-    pub span: MockSpan,
+    span: MockSpan,
+    spans: Vec<MockSpan>,
 }
+
+#[derive(Debug, Deserialize)]
+struct MockEventHelper {
+    #[serde(default)]
+    span: Option<MockSpan>,
+    #[serde(default)]
+    spans: Vec<MockSpan>,
+}
+
+impl MockEventWithSpan {
+    pub fn span(&self) -> &MockSpan {
+        &self.span
+    }
+
+    pub fn spans(&self) -> &[MockSpan] {
+        &self.spans
+    }
+}
+
+impl TryFrom<MockEventHelper> for MockEventWithSpan {
+    type Error = serde_json::Error;
+
+    fn try_from(helper: MockEventHelper) -> Result<Self, Self::Error> {
+        let MockEventHelper { span, spans } = helper;
+
+        let span = match (span, spans.last().cloned()) {
+            (Some(span), _) => span,
+            (None, Some(fallback)) => fallback,
+            (None, None) => {
+                return Err(serde_json::Error::io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "missing span",
+                )))
+            }
+        };
+
+        Ok(Self { span, spans })
+    }
+}
+
 
 #[derive(Debug, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]

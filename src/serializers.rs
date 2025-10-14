@@ -41,17 +41,25 @@ where
         match serde_json::from_str::<Value>(formatted_fields) {
             // handle string escaping "properly" (this should be fixed upstream)
             // https://github.com/tokio-rs/tracing/issues/391
-            Ok(Value::Object(fields)) => {
+            Ok(Value::Object(mut fields)) => {
+                let flattened_name = fields.remove("spanName");
+
                 for (key, value) in fields {
                     map.serialize_entry(&key, &value)?;
                 }
+
+                if let Some(value) = flattened_name {
+                    map.serialize_entry("name", &value)?;
+                } else if !name.is_empty() {
+                    map.serialize_entry("name", &name)?;
+                }
             }
+            Ok(Value::Null) => {}
             // these two options should be impossible
             Ok(value) => panic!("Invalid value: {}", value),
             Err(error) => panic!("Error parsing logs: {}", error),
         };
 
-        map.serialize_entry("name", &name)?;
         map.end()
     }
 }

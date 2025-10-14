@@ -125,12 +125,24 @@ impl EventFormatter {
     {
         let time = OffsetDateTime::now_utc().format(&Rfc3339)?;
         let meta = event.metadata();
-        let severity = LogSeverity::from(meta.level());
 
+        // attempt to resolve the explicit parent first. If that fails, fall back to the
+        // current span for backwards compatibility.
         let span = event
             .parent()
             .and_then(|id| context.span(id))
             .or_else(|| context.lookup_current());
+
+        // Extract event fields first
+        let mut visitor = EventFieldVisitor(serde_json::Map::new(), context.field_format());
+        event.record(&mut visitor);
+
+        // Check if there's a custom severity in the fields, otherwise use the log level
+        let severity = visitor
+            .0
+            .remove("severity")
+            .map(LogSeverity::from)
+            .unwrap_or_else(|| LogSeverity::from(meta.level()));
 
         let mut map = serializer.serialize_map(None)?;
 
@@ -138,18 +150,53 @@ impl EventFormatter {
         map.serialize_entry("time", &time)?;
         map.serialize_entry("target", meta.target())?;
 
-        // Extract and serialize event fields
-        let mut visitor = EventFieldVisitor(serde_json::Map::new(), context.field_format());
-        event.record(&mut visitor);
+        // Process fields with special handling for http_request, labels, and insert_id
+        let mut http_request = std::collections::BTreeMap::new();
+        let mut labels = std::collections::BTreeMap::new();
 
         for (key, value) in visitor.0 {
-            // The "message" field is often the primary human-readable content.
-            // Google Cloud Logging expects this at the top level of jsonPayload.
-            if key == "message" {
-                map.serialize_entry("message", &value)?;
-            } else {
-                map.serialize_entry(&key, &value)?;
+            let mut key_segments = key.splitn(2, '.');
+
+            match (key_segments.next(), key_segments.next()) {
+                (Some("http_request"), Some(request_key)) => {
+                    use inflector::Inflector;
+                    http_request.insert(request_key.to_camel_case(), value);
+                }
+                (Some("labels"), Some(label_key)) => {
+                    use inflector::Inflector;
+                    let value = match value {
+                        serde_json::Value::String(value) => value,
+                        _ => value.to_string(),
+                    };
+                    labels.insert(label_key.to_camel_case(), value);
+                }
+                (Some("insert_id"), None) => {
+                    let value = match value {
+                        serde_json::Value::String(value) => value,
+                        _ => value.to_string(),
+                    };
+                    map.serialize_entry("logging.googleapis.com/insertId", &value)?;
+                }
+                (Some("message"), None) => {
+                    map.serialize_entry("message", &value)?;
+                }
+                (Some(key), None) => {
+                    use inflector::Inflector;
+                    map.serialize_entry(&key.to_camel_case(), &value)?;
+                }
+                _ => {
+                    use inflector::Inflector;
+                    map.serialize_entry(&key.to_camel_case(), &value)?;
+                }
             }
+        }
+
+        if !http_request.is_empty() {
+            map.serialize_entry("httpRequest", &http_request)?;
+        }
+
+        if !labels.is_empty() {
+            map.serialize_entry("logging.googleapis.com/labels", &labels)?;
         }
 
         if self.include_source_location {
@@ -164,48 +211,62 @@ impl EventFormatter {
             }
         }
 
-        if let Some(span_ref) = span {
+        let spans_value = serde_json::to_value(SerializableContext::new(context))
+            .map_err(Error::Serialization)?;
+        let spans_array = spans_value.as_array();
+
+        if let Some(span_ref) = span.as_ref() {
             map.serialize_entry("span", &SerializableSpan::new(&span_ref))?;
-            map.serialize_entry("spans", &SerializableContext::new(context))?;
+        } else if let Some(spans) = spans_array {
+            if let Some(last_span) = spans.last() {
+                map.serialize_entry("span", last_span)?;
+            }
+        }
 
-            #[cfg(feature = "opentelemetry")]
-            if let Some(config) = self.cloud_trace_configuration.as_ref() {
-                // Attempt to get OpenTelemetry trace and span IDs
-                let mut otel_trace_id: Option<String> = None;
-                let mut otel_span_id: Option<String> = None;
-                let mut otel_is_sampled: Option<bool> = None;
+        if spans_array.map_or(false, |arr| !arr.is_empty()) {
+            map.serialize_entry("spans", &spans_value)?;
+        }
 
-                // Iterate through extensions to find OtelData
-                if let Some(extensions) = span_ref
-                    .extensions()
-                    .get::<tracing_opentelemetry::OtelData>()
-                {
-                    let otel_ctx = &extensions.parent_cx; // Use parent_cx as it reflects the context when span was created
-                    use opentelemetry::trace::TraceContextExt;
-                    if otel_ctx.has_active_span() {
-                        let otel_span_ref = otel_ctx.span();
-                        let otel_span_context = otel_span_ref.span_context();
+        #[cfg(feature = "opentelemetry")]
+        if let (Some(span_ref), Some(config)) =
+            (span.as_ref(), self.cloud_trace_configuration.as_ref())
+        {
+            // Attempt to get OpenTelemetry trace and span IDs
+            let mut otel_trace_id: Option<String> = None;
+            let mut otel_span_id: Option<String> = None;
+            let mut otel_is_sampled: Option<bool> = None;
 
-                        otel_trace_id = Some(format!(
-                            "projects/{}/traces/{}",
-                            config.project_id,
-                            otel_span_context.trace_id()
-                        ));
-                        otel_span_id = Some(otel_span_context.span_id().to_string());
-                        otel_is_sampled = Some(otel_span_context.is_sampled());
-                    }
+            // Iterate through extensions to find OtelData
+            if let Some(otel_data) = span_ref
+                .extensions()
+                .get::<tracing_opentelemetry::OtelData>()
+            {
+                // Get trace ID and span ID from OtelData using the new API
+                if let Some(trace_id) = otel_data.trace_id() {
+                    otel_trace_id = Some(format!(
+                        "projects/{}/traces/{}",
+                        config.project_id, trace_id
+                    ));
                 }
 
-                if let Some(trace_id_val) = otel_trace_id {
-                    map.serialize_entry("logging.googleapis.com/trace", &trace_id_val)?;
+                if let Some(span_id) = otel_data.span_id() {
+                    otel_span_id = Some(span_id.to_string());
                 }
-                if let Some(span_id_val) = otel_span_id {
-                    map.serialize_entry("logging.googleapis.com/spanId", &span_id_val)?;
-                }
-                if let Some(true) = otel_is_sampled {
-                    // Only add if true
-                    map.serialize_entry("logging.googleapis.com/trace_sampled", &true)?;
-                }
+
+                // Note: In OpenTelemetry 0.31+, the sampled flag is not directly accessible
+                // from OtelData without the full span context. Setting to None for now.
+                otel_is_sampled = None;
+            }
+
+            if let Some(trace_id_val) = otel_trace_id {
+                map.serialize_entry("logging.googleapis.com/trace", &trace_id_val)?;
+            }
+            if let Some(span_id_val) = otel_span_id {
+                map.serialize_entry("logging.googleapis.com/spanId", &span_id_val)?;
+            }
+            if let Some(true) = otel_is_sampled {
+                // Only add if true
+                map.serialize_entry("logging.googleapis.com/trace_sampled", &true)?;
             }
         }
 
@@ -242,4 +303,3 @@ impl Default for EventFormatter {
         }
     }
 }
-

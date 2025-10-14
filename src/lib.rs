@@ -4,6 +4,18 @@
 #![allow(clippy::needless_doctest_main)]
 #![doc = include_str!("../README.md")]
 
+// Dummy uses to satisfy unused_crate_dependencies lint
+#[cfg(feature = "valuable")]
+use http as _;
+#[cfg(feature = "opentelemetry")]
+use opentelemetry as _;
+#[cfg(feature = "valuable")]
+use url as _;
+#[cfg(feature = "valuable")]
+use valuable as _;
+#[cfg(feature = "valuable")]
+use valuable_serde as _;
+
 mod event_formatter;
 mod google;
 mod layer;

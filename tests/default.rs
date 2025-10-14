@@ -20,8 +20,26 @@ fn includes_span() {
     .expect("Error converting test buffer to JSON");
 
     let event = events.first().expect("No event heard");
-    assert_eq!(event.span.name, "stackdriver_span");
-    assert_eq!(event.span.foo, "bar");
+    let span = event.span();
+    assert_eq!(span.span_name, "stackdriver_span");
+    assert_eq!(span.foo, "bar");
+}
+
+#[test]
+fn parses_payload_with_only_spans_array() {
+    let payload = serde_json::json!({
+        "message": "from sample log",
+        "spans": [
+            {"spanName": "root", "foo": "bar"},
+            {"name": "child", "foo": "baz"}
+        ]
+    });
+
+    let event: MockEventWithSpan = serde_json::from_value(payload).expect("Failed to parse payload");
+    let span = event.span();
+    assert_eq!(span.span_name, "child");
+    assert_eq!(span.foo, "baz");
+    assert_eq!(event.spans().len(), 2);
 }
 
 #[test]

@@ -1,11 +1,8 @@
 #![cfg(feature = "opentelemetry")]
 use helpers::MockWriter;
 use lazy_static::lazy_static;
-use opentelemetry::{
-    testing::trace::TestSpan,
-    trace::{SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TraceState},
-};
-use opentelemetry_sdk::trace::TracerProvider;
+use opentelemetry::trace::{SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TraceState};
+use opentelemetry_sdk::trace::SdkTracerProvider;
 use rand::Rng;
 use serde::{de::Error, Deserialize, Deserializer};
 use std::{
@@ -26,7 +23,7 @@ lazy_static! {
     };
 
     // use a tracer that generates valid span IDs (unlike default NoopTracer)
-    static ref TRACER: TracerProvider = TracerProvider::builder()
+    static ref TRACER: SdkTracerProvider = SdkTracerProvider::builder()
         .with_simple_exporter(opentelemetry_stdout::SpanExporter::default())
         .build();
 }
@@ -73,16 +70,19 @@ where
                 .with_cloud_trace(CLOUD_TRACE_CONFIGURATION.clone()),
         );
 
-    // generate a context for events
-    let context = opentelemetry::Context::current_with_span(TestSpan(SpanContext::new(
+    // generate a context for events with injected span context
+    // In OpenTelemetry 0.31+, we inject the span context through the OpenTelemetry layer
+    // The layer will automatically pick up the current context
+    let span_context = SpanContext::new(
         trace_id,
         span_id,
         TraceFlags::default(),
         false,
         TraceState::default(),
-    )));
+    );
 
-    // attach the tracing context
+    // Create a context with the span context
+    let context = opentelemetry::Context::current().with_remote_span_context(span_context);
     let _context = context.attach();
 
     // run the callback in a tracing context
@@ -98,8 +98,8 @@ fn includes_correct_cloud_trace_fields() {
 
     // generate relevant IDs
     let mut rng = rand::thread_rng();
-    let span_id = SpanId::from_u64(rng.gen());
-    let trace_id = TraceId::from_u128(rng.gen());
+    let span_id = SpanId::from_bytes(rng.gen());
+    let trace_id = TraceId::from_bytes(rng.gen());
 
     // generate a tracing-based event
     test_with_tracing(span_id, trace_id, make_writer, || {
@@ -137,8 +137,8 @@ fn handles_nested_spans() {
 
     // generate relevant IDs
     let mut rng = rand::thread_rng();
-    let span_id = SpanId::from_u64(rng.gen());
-    let trace_id = TraceId::from_u128(rng.gen());
+    let span_id = SpanId::from_bytes(rng.gen());
+    let trace_id = TraceId::from_bytes(rng.gen());
 
     // generate a set of nested tracing-based events
     test_with_tracing(span_id, trace_id, make_writer, || {
