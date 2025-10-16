@@ -233,53 +233,59 @@ impl EventFormatter {
         if let (Some(span_ref), Some(config)) =
             (span.as_ref(), self.cloud_trace_configuration.as_ref())
         {
-            // Attempt to get OpenTelemetry trace and span IDs
-            let mut otel_trace_id: Option<String> = None;
-            let mut otel_span_id: Option<String> = None;
-            let mut otel_is_sampled: Option<bool> = None;
-
-            // Iterate through extensions to find OtelData
+            // Access OtelData to get the OpenTelemetry span information
+            // that was created by tracing_opentelemetry for this tracing span
             if let Some(otel_data) = span_ref
                 .extensions()
                 .get::<tracing_opentelemetry::OtelData>()
             {
-                // Get trace ID from parent_cx for distributed tracing
-                let otel_ctx = &otel_data.parent_cx;
-                if otel_ctx.has_active_span() {
-                    let otel_span_ref = otel_ctx.span();
-                    let otel_span_context = otel_span_ref.span_context();
+                let mut otel_trace_id: Option<String> = None;
+                let mut otel_span_id: Option<String> = None;
+                let mut otel_is_sampled: Option<bool> = None;
+
+                // Get trace ID and sampling from the parent context
+                // (trace IDs are propagated, not generated per span)
+                let parent_cx = &otel_data.parent_cx;
+                if parent_cx.has_active_span() {
+                    let parent_span = parent_cx.span();
+                    let parent_span_context = parent_span.span_context();
 
                     otel_trace_id = Some(format!(
                         "projects/{}/traces/{}",
                         config.project_id,
-                        otel_span_context.trace_id()
+                        parent_span_context.trace_id()
                     ));
-                    otel_is_sampled = Some(otel_span_context.is_sampled());
+                    otel_is_sampled = Some(parent_span_context.is_sampled());
                 }
 
-                // Get span ID: try builder first (current span), then parent_cx only if not remote
+                // Get span ID from builder (the span being created for this tracing span)
+                // If builder.span_id is None, it means the span hasn't been started yet,
+                // so we fall back to using Context::current() to get the active span
                 if let Some(span_id) = otel_data.builder.span_id {
-                    // Use the current span's ID from builder
                     otel_span_id = Some(span_id.to_string());
-                } else if otel_ctx.has_active_span() {
-                    let otel_span_ref = otel_ctx.span();
-                    let otel_span_context = otel_span_ref.span_context();
-                    // Only use parent span ID if it's not from a remote service
-                    if !otel_span_context.is_remote() {
-                        otel_span_id = Some(otel_span_context.span_id().to_string());
+                } else {
+                    // Fallback: get the current active OpenTelemetry span
+                    let current_cx = opentelemetry::Context::current();
+                    if current_cx.has_active_span() {
+                        let current_span = current_cx.span();
+                        let current_span_context = current_span.span_context();
+                        // Only use if it's not a remote span (it's a local span we created)
+                        if !current_span_context.is_remote() {
+                            otel_span_id = Some(current_span_context.span_id().to_string());
+                        }
                     }
                 }
-            }
 
-            if let Some(trace_id_val) = otel_trace_id {
-                map.serialize_entry("logging.googleapis.com/trace", &trace_id_val)?;
-            }
-            if let Some(span_id_val) = otel_span_id {
-                map.serialize_entry("logging.googleapis.com/spanId", &span_id_val)?;
-            }
-            if let Some(true) = otel_is_sampled {
-                // Only add if true
-                map.serialize_entry("logging.googleapis.com/trace_sampled", &true)?;
+                // Write the Cloud Trace fields
+                if let Some(trace_id) = otel_trace_id {
+                    map.serialize_entry("logging.googleapis.com/trace", &trace_id)?;
+                }
+                if let Some(span_id) = otel_span_id {
+                    map.serialize_entry("logging.googleapis.com/spanId", &span_id)?;
+                }
+                if let Some(true) = otel_is_sampled {
+                    map.serialize_entry("logging.googleapis.com/trace_sampled", &true)?;
+                }
             }
         }
 

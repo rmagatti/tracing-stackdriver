@@ -9,6 +9,8 @@
 use http as _;
 #[cfg(feature = "opentelemetry")]
 use opentelemetry as _;
+#[cfg(feature = "opentelemetry")]
+use tracing_opentelemetry as _;
 #[cfg(feature = "valuable")]
 use url as _;
 #[cfg(feature = "valuable")]
