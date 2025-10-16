@@ -3,6 +3,8 @@ use crate::{
     serializers::{SerializableContext, SerializableSpan, SourceLocation},
     writer::WriteAdaptor,
 };
+#[cfg(feature = "opentelemetry")]
+use opentelemetry::trace::TraceContextExt;
 use serde::ser::{SerializeMap, Serializer as _};
 use std::fmt;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
@@ -241,21 +243,20 @@ impl EventFormatter {
                 .extensions()
                 .get::<tracing_opentelemetry::OtelData>()
             {
-                // Get trace ID and span ID from OtelData using the new API
-                if let Some(trace_id) = otel_data.trace_id() {
+                // Use parent_cx as it reflects the context when span was created
+                let otel_ctx = &otel_data.parent_cx;
+                if otel_ctx.has_active_span() {
+                    let otel_span_ref = otel_ctx.span();
+                    let otel_span_context = otel_span_ref.span_context();
+
                     otel_trace_id = Some(format!(
                         "projects/{}/traces/{}",
-                        config.project_id, trace_id
+                        config.project_id,
+                        otel_span_context.trace_id()
                     ));
+                    otel_span_id = Some(otel_span_context.span_id().to_string());
+                    otel_is_sampled = Some(otel_span_context.is_sampled());
                 }
-
-                if let Some(span_id) = otel_data.span_id() {
-                    otel_span_id = Some(span_id.to_string());
-                }
-
-                // Note: In OpenTelemetry 0.31+, the sampled flag is not directly accessible
-                // from OtelData without the full span context. Setting to None for now.
-                otel_is_sampled = None;
             }
 
             if let Some(trace_id_val) = otel_trace_id {
