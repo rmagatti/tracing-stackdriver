@@ -50,21 +50,20 @@ let trace_id = otel_data.builder.trace_id.or_else(|| {
 
 #### Span ID Extraction
 ```rust
-let span_id = otel_data.builder.span_id.or_else(|| {
-    let span_ref = otel_data.parent_cx.span();
-    let span_context = span_ref.span_context();
-    if span_context.is_valid() {
-        Some(span_context.span_id())
-    } else {
-        None
-    }
-});
+// Get span ID from builder only (not parent context)
+// Only local spans should be included, not remote parent spans
+// Remote parent span IDs will show as "Missing span ID" in Cloud Trace
+// since they're not exported by this service
+if let Some(span_id) = otel_data.builder.span_id {
+    otel_span_id = Some(span_id.to_string());
+}
 ```
 
-This dual-extraction approach ensures that:
-- Root spans from external requests (e.g., HTTP middleware) have proper span IDs
-- Child spans created within your application also have correct span IDs
-- The full trace hierarchy is preserved in Cloud Trace
+**Important:** Unlike trace IDs, span IDs are NOT extracted from the parent context. This is intentional:
+- **Trace ID propagation**: Enables distributed tracing across services
+- **Span ID isolation**: Only references spans that this service actually exports to Cloud Trace
+
+This prevents "Missing span ID" errors that occur when logs reference remote parent spans from calling services. Remote spans aren't exported by your service, so Cloud Trace can't find them.
 
 ### 4. Sampling Decision Detection
 
@@ -219,11 +218,31 @@ This enables the **Trace** button in Google Cloud Logging console, allowing you 
 
 ## Cloud Trace Behavior
 
-### Before the Fix
-The first trace screenshot showed a "Missing span ID" at the root level, which made it difficult to correlate the root span with logs from the entry point of your service.
+### Understanding "Missing span ID"
 
-### After the Fix
-Now the root span properly shows its span ID (e.g., `57ccf9ae4e434845`), and all child spans are correctly nested under it. This provides a complete view of the request flow through your service.
+The "Missing span ID" message appears when logs reference a span ID that isn't exported by the current service to Cloud Trace. This commonly occurs with:
+
+1. **Remote parent spans**: When your service receives a request with trace context from another service
+2. **External middleware spans**: Spans created outside your service that propagate trace context
+
+### The Solution
+
+**Trace ID**: Propagate from parent context for distributed tracing
+- Allows traces to span multiple services
+- Enables end-to-end request tracking
+
+**Span ID**: Only use local span IDs from `builder.span_id`
+- Ensures all referenced spans are actually exported by your service
+- Eliminates "Missing span ID" errors in Cloud Trace
+- Your service's spans form a clean hierarchy under the distributed trace
+
+### What You'll See
+
+After this fix, your Cloud Trace will show:
+- ✅ Complete trace hierarchy with no "Missing span ID" errors
+- ✅ Only spans created and exported by your service
+- ✅ Proper parent-child relationships for local spans
+- ✅ Trace IDs that connect to upstream/downstream services
 
 ## Testing
 
@@ -241,15 +260,20 @@ cargo test --features opentelemetry
 
 3. **Trace ID Format**: The library automatically formats trace IDs as `projects/PROJECT_ID/traces/TRACE_ID` (32-character hex string).
 
-4. **Context Propagation**: The implementation now properly extracts both trace IDs and span IDs from the parent context, ensuring correct trace correlation even when these values aren't directly in the span builder. This is critical for:
-   - HTTP middleware that creates root spans
-   - Cross-service trace propagation
-   - Correct parent-child span relationships
+4. **Context Propagation**: 
+   - **Trace IDs**: Extracted from builder OR parent context (enables distributed tracing)
+   - **Span IDs**: Extracted from builder ONLY (prevents "Missing span ID" errors)
+   
+   This distinction is critical:
+   - Trace ID propagation enables cross-service tracing
+   - Span ID isolation ensures only local, exported spans are referenced
+   - Prevents referencing remote parent spans that aren't in your service's trace export
 
-5. **Span ID Extraction Priority**:
-   - First checks `otel_data.builder.span_id` (current span)
-   - Falls back to `otel_data.parent_cx.span().span_context().span_id()` (parent context)
-   - This ensures root spans from middleware have proper span IDs
+5. **Span ID Behavior**:
+   - Only `otel_data.builder.span_id` is used (local spans only)
+   - Remote parent span IDs are intentionally NOT included
+   - This prevents "Missing span ID" errors in Cloud Trace
+   - Your logs will only reference spans that your service actually exports
 
 ## Troubleshooting
 
@@ -262,10 +286,24 @@ cargo test --features opentelemetry
 
 ### Missing span ID in Cloud Trace
 
-This should now be fixed. If you still see "Missing span ID":
-1. Ensure you're using the latest version with the parent context extraction
-2. Verify your OpenTelemetry middleware is creating spans correctly
-3. Check that the `tracing-opentelemetry` layer is added before the `tracing-stackdriver` layer
+If you see "Missing span ID" in Cloud Trace, this is **expected behavior** for remote parent spans:
+
+**Expected (not an error):**
+- `(Missing span ID xyz123)` where `xyz123` is from an upstream service
+- This happens when your service receives requests with trace context from other services
+- The parent span isn't exported by your service, so Cloud Trace can't display it
+- Your service's spans will still appear correctly in the trace hierarchy
+
+**Actual problem (needs fixing):**
+- Your own service's spans showing as missing
+- Logs not correlating with traces at all
+- No trace button appearing in Cloud Logging
+
+To debug actual issues:
+1. Verify your OpenTelemetry middleware is creating spans correctly
+2. Check that the `tracing-opentelemetry` layer is added before the `tracing-stackdriver` layer
+3. Ensure spans are being entered (use `let _guard = span.enter()`)
+4. Verify logs show `logging.googleapis.com/spanId` in the JSON output
 
 ### Version conflicts
 
@@ -331,9 +369,9 @@ The parent context extraction adds minimal overhead:
 ## Summary of Benefits
 
 ✅ **Full OpenTelemetry 0.30 compatibility** for use with Poem and similar frameworks  
-✅ **Proper span ID extraction** fixing the "Missing span ID" issue  
-✅ **Complete trace hierarchy** in Cloud Trace UI  
+✅ **Proper span ID handling** - only local spans referenced (no "Missing span ID" errors)  
+✅ **Complete trace hierarchy** in Cloud Trace UI showing your service's spans  
 ✅ **Trace button** enabled in Cloud Logging for all correlated logs  
-✅ **Robust context propagation** using parent context fallback  
+✅ **Distributed tracing support** via trace ID propagation across services  
 ✅ **All tests passing** with comprehensive coverage  
 ✅ **Production-ready** with minimal performance overhead  
