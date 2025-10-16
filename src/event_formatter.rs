@@ -3,6 +3,8 @@ use crate::{
     serializers::{SerializableContext, SerializableSpan, SourceLocation},
     writer::WriteAdaptor,
 };
+#[cfg(feature = "opentelemetry")]
+use opentelemetry::trace::TraceContextExt;
 use serde::ser::{SerializeMap, Serializer as _};
 use std::fmt;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
@@ -241,21 +243,36 @@ impl EventFormatter {
                 .extensions()
                 .get::<tracing_opentelemetry::OtelData>()
             {
-                // Get trace ID and span ID from OtelData using the new API
-                if let Some(trace_id) = otel_data.trace_id() {
+                // Get trace ID from builder or parent context
+                let trace_id = otel_data.builder.trace_id.or_else(|| {
+                    let span_ref = otel_data.parent_cx.span();
+                    let span_context = span_ref.span_context();
+                    if span_context.is_valid() {
+                        Some(span_context.trace_id())
+                    } else {
+                        None
+                    }
+                });
+
+                if let Some(trace_id) = trace_id {
                     otel_trace_id = Some(format!(
                         "projects/{}/traces/{}",
                         config.project_id, trace_id
                     ));
                 }
 
-                if let Some(span_id) = otel_data.span_id() {
+                // Get span ID from builder
+                if let Some(span_id) = otel_data.builder.span_id {
                     otel_span_id = Some(span_id.to_string());
                 }
 
-                // Note: In OpenTelemetry 0.31+, the sampled flag is not directly accessible
-                // from OtelData without the full span context. Setting to None for now.
-                otel_is_sampled = None;
+                // Check if the trace is sampled from the sampling result
+                if let Some(sampling_result) = &otel_data.builder.sampling_result {
+                    otel_is_sampled = Some(matches!(
+                        sampling_result.decision,
+                        opentelemetry::trace::SamplingDecision::RecordAndSample
+                    ));
+                }
             }
 
             if let Some(trace_id_val) = otel_trace_id {
