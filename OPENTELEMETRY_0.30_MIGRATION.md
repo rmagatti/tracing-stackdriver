@@ -65,7 +65,41 @@ if let Some(span_id) = otel_data.builder.span_id {
 
 This prevents "Missing span ID" errors that occur when logs reference remote parent spans from calling services. Remote spans aren't exported by your service, so Cloud Trace can't find them.
 
-### 4. Sampling Decision Detection
+### 4. Critical: Layer Ordering
+
+**⚠️ IMPORTANT:** The order of tracing layers matters significantly. The OpenTelemetry layer MUST be added before the Stackdriver layer in your subscriber chain.
+
+**Correct order:**
+```rust
+let subscriber = Registry::default()
+    .with(env_filter)
+    .with(telemetry_layer)      // OpenTelemetry FIRST
+    .with(gcp_logging_layer)     // Stackdriver SECOND
+    .with(metrics_layer);
+```
+
+**Incorrect order (causes missing span IDs):**
+```rust
+let subscriber = Registry::default()
+    .with(env_filter)
+    .with(gcp_logging_layer)     // ❌ Stackdriver first
+    .with(telemetry_layer)       // ❌ OpenTelemetry second
+    .with(metrics_layer);
+```
+
+**Why this matters:**
+- Layers process events in the order they're added
+- OpenTelemetry layer populates `OtelData` (including `builder.span_id`) in span extensions
+- Stackdriver layer reads `OtelData` from span extensions to format logs
+- If Stackdriver runs first, `OtelData` doesn't exist yet → missing span IDs
+- If OpenTelemetry runs first, `OtelData` is populated → span IDs are available
+
+**Symptoms of incorrect ordering:**
+- "Missing span ID" errors in Cloud Trace for ALL spans (including local ones)
+- Logs show trace correlation but Cloud Trace can't find the spans
+- `logging.googleapis.com/spanId` field is missing from log entries
+
+### 5. Sampling Decision Detection
 
 The sampling decision is now checked using pattern matching on the `SamplingDecision` enum:
 
@@ -260,7 +294,13 @@ cargo test --features opentelemetry
 
 3. **Trace ID Format**: The library automatically formats trace IDs as `projects/PROJECT_ID/traces/TRACE_ID` (32-character hex string).
 
-4. **Context Propagation**: 
+4. **Layer Ordering**: 
+   - **CRITICAL**: OpenTelemetry layer MUST come before Stackdriver layer
+   - Ensures `OtelData` is populated before logs are formatted
+   - Incorrect ordering causes all span IDs to be missing (not just remote ones)
+   - See section "4. Critical: Layer Ordering" above for details
+
+5. **Context Propagation**: 
    - **Trace IDs**: Extracted from builder OR parent context (enables distributed tracing)
    - **Span IDs**: Extracted from builder ONLY (prevents "Missing span ID" errors)
    
@@ -269,7 +309,7 @@ cargo test --features opentelemetry
    - Span ID isolation ensures only local, exported spans are referenced
    - Prevents referencing remote parent spans that aren't in your service's trace export
 
-5. **Span ID Behavior**:
+6. **Span ID Behavior**:
    - Only `otel_data.builder.span_id` is used (local spans only)
    - Remote parent span IDs are intentionally NOT included
    - This prevents "Missing span ID" errors in Cloud Trace
@@ -286,7 +326,9 @@ cargo test --features opentelemetry
 
 ### Missing span ID in Cloud Trace
 
-If you see "Missing span ID" in Cloud Trace, this is **expected behavior** for remote parent spans:
+**First, check layer ordering!** If ALL your spans show as missing (not just remote parent spans), your layers are in the wrong order. See section "4. Critical: Layer Ordering" above.
+
+If you see "Missing span ID" in Cloud Trace for only some spans, this is **expected behavior** for remote parent spans:
 
 **Expected (not an error):**
 - `(Missing span ID xyz123)` where `xyz123` is from an upstream service
@@ -300,10 +342,10 @@ If you see "Missing span ID" in Cloud Trace, this is **expected behavior** for r
 - No trace button appearing in Cloud Logging
 
 To debug actual issues:
-1. Verify your OpenTelemetry middleware is creating spans correctly
-2. Check that the `tracing-opentelemetry` layer is added before the `tracing-stackdriver` layer
-3. Ensure spans are being entered (use `let _guard = span.enter()`)
-4. Verify logs show `logging.googleapis.com/spanId` in the JSON output
+1. **CHECK LAYER ORDER FIRST** - OpenTelemetry must come before Stackdriver
+2. Verify logs show `logging.googleapis.com/spanId` in the JSON output
+3. Verify your OpenTelemetry middleware is creating spans correctly
+4. Ensure spans are being entered (use `let _guard = span.enter()`)
 
 ### Version conflicts
 
@@ -373,5 +415,19 @@ The parent context extraction adds minimal overhead:
 ✅ **Complete trace hierarchy** in Cloud Trace UI showing your service's spans  
 ✅ **Trace button** enabled in Cloud Logging for all correlated logs  
 ✅ **Distributed tracing support** via trace ID propagation across services  
+✅ **Correct layer ordering** - documented critical setup requirement  
 ✅ **All tests passing** with comprehensive coverage  
 ✅ **Production-ready** with minimal performance overhead  
+
+## Quick Troubleshooting Checklist
+
+If you're seeing "Missing span ID" errors:
+
+1. ✅ **Layer order**: Is `tracing-opentelemetry` layer added BEFORE `tracing-stackdriver`?
+2. ✅ **Feature flag**: Is `features = ["opentelemetry"]` enabled for `tracing-stackdriver`?
+3. ✅ **Project ID**: Does `CloudTraceConfiguration.project_id` match your GCP project?
+4. ✅ **Span context**: Are you creating and entering spans with `tracing::span!`?
+5. ✅ **Log output**: Do logs contain `logging.googleapis.com/spanId` field?
+
+If all local spans show as missing → **Layer order is wrong**  
+If only root/parent spans show as missing → **Expected for remote parent spans**
