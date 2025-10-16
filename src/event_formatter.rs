@@ -4,7 +4,7 @@ use crate::{
     writer::WriteAdaptor,
 };
 #[cfg(feature = "opentelemetry")]
-use opentelemetry::trace::TraceContextExt;
+use opentelemetry::trace::{SamplingDecision, TraceContextExt};
 use serde::ser::{SerializeMap, Serializer as _};
 use std::fmt;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
@@ -247,9 +247,7 @@ impl EventFormatter {
                 // (trace IDs are propagated, not generated per span)
                 let parent_cx = &otel_data.parent_cx;
                 if parent_cx.has_active_span() {
-                    let parent_span = parent_cx.span();
-                    let parent_span_context = parent_span.span_context();
-
+                    let parent_span_context = parent_cx.span().span_context();
                     otel_trace_id = Some(format!(
                         "projects/{}/traces/{}",
                         config.project_id,
@@ -258,21 +256,47 @@ impl EventFormatter {
                     otel_is_sampled = Some(parent_span_context.is_sampled());
                 }
 
-                // Get span ID from builder (the span being created for this tracing span)
-                // If builder.span_id is None, it means the span hasn't been started yet,
-                // so we fall back to using Context::current() to get the active span
-                if let Some(span_id) = otel_data.builder.span_id {
-                    otel_span_id = Some(span_id.to_string());
-                } else {
-                    // Fallback: get the current active OpenTelemetry span
-                    let current_cx = opentelemetry::Context::current();
-                    if current_cx.has_active_span() {
-                        let current_span = current_cx.span();
-                        let current_span_context = current_span.span_context();
-                        // Only use if it's not a remote span (it's a local span we created)
-                        if !current_span_context.is_remote() {
+                if otel_trace_id.is_none() {
+                    if let Some(trace_id) = otel_data.builder.trace_id {
+                        otel_trace_id = Some(format!(
+                            "projects/{}/traces/{}",
+                            config.project_id,
+                            trace_id
+                        ));
+                    }
+                }
+
+                if otel_is_sampled.is_none() {
+                    if let Some(sampling_result) = otel_data.builder.sampling_result.as_ref() {
+                        if matches!(sampling_result.decision, SamplingDecision::RecordAndSample) {
+                            otel_is_sampled = Some(true);
+                        }
+                    }
+                }
+
+                if otel_span_id.is_none() {
+                    if let Some(span_id) = otel_data.builder.span_id {
+                        otel_span_id = Some(span_id.to_string());
+                    }
+                }
+
+                let current_cx = opentelemetry::Context::current();
+                if current_cx.has_active_span() {
+                    let current_span_context = current_cx.span().span_context();
+                    if !current_span_context.is_remote() {
+                        if otel_trace_id.is_none() {
+                            otel_trace_id = Some(format!(
+                                "projects/{}/traces/{}",
+                                config.project_id,
+                                current_span_context.trace_id()
+                            ));
+                        }
+                        if otel_span_id.is_none() {
                             otel_span_id = Some(current_span_context.span_id().to_string());
                         }
+                    }
+                    if otel_is_sampled.is_none() && current_span_context.is_sampled() {
+                        otel_is_sampled = Some(true);
                     }
                 }
 
