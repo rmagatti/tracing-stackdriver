@@ -261,11 +261,21 @@ impl EventFormatter {
                     ));
                 }
 
-                // Get span ID from builder only (not parent context)
-                // Only local spans should be included, not remote parent spans
-                // Remote parent span IDs will show as "Missing span ID" in Cloud Trace
-                // since they're not exported by this service
-                if let Some(span_id) = otel_data.builder.span_id {
+                // Get span ID from builder or local parent context
+                // Include local parent spans (e.g., from Poem middleware) but exclude remote parent spans
+                // Remote parent spans are from other services and won't be in this service's trace export
+                let span_id = otel_data.builder.span_id.or_else(|| {
+                    let span_ref = otel_data.parent_cx.span();
+                    let span_context = span_ref.span_context();
+                    // Only include parent span ID if it's local (not from another service)
+                    if span_context.is_valid() && !span_context.is_remote() {
+                        Some(span_context.span_id())
+                    } else {
+                        None
+                    }
+                });
+
+                if let Some(span_id) = span_id {
                     otel_span_id = Some(span_id.to_string());
                 }
 

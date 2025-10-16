@@ -50,20 +50,36 @@ let trace_id = otel_data.builder.trace_id.or_else(|| {
 
 #### Span ID Extraction
 ```rust
-// Get span ID from builder only (not parent context)
-// Only local spans should be included, not remote parent spans
-// Remote parent span IDs will show as "Missing span ID" in Cloud Trace
-// since they're not exported by this service
-if let Some(span_id) = otel_data.builder.span_id {
-    otel_span_id = Some(span_id.to_string());
-}
+// Get span ID from builder or local parent context
+// Include local parent spans (e.g., from Poem middleware) but exclude remote parent spans
+// Remote parent spans are from other services and won't be in this service's trace export
+let span_id = otel_data.builder.span_id.or_else(|| {
+    let span_ref = otel_data.parent_cx.span();
+    let span_context = span_ref.span_context();
+    // Only include parent span ID if it's local (not from another service)
+    if span_context.is_valid() && !span_context.is_remote() {
+        Some(span_context.span_id())
+    } else {
+        None
+    }
+});
 ```
 
-**Important:** Unlike trace IDs, span IDs are NOT extracted from the parent context. This is intentional:
-- **Trace ID propagation**: Enables distributed tracing across services
-- **Span ID isolation**: Only references spans that this service actually exports to Cloud Trace
+**Important distinction - Local vs Remote spans:**
+- **Local spans**: Created by your service (middleware, instrumented functions, etc.)
+  - These SHOULD be included in logs
+  - They're exported by your service to Cloud Trace
+  - Examples: Poem HTTP middleware spans, local tracing spans
+  
+- **Remote spans**: Created by other services that called yours
+  - These should NOT be included in logs
+  - They're not exported by your service (the calling service exports them)
+  - Would cause "Missing span ID" errors in Cloud Trace
+  
+- **Trace ID propagation**: Always propagated (enables distributed tracing across services)
+- **Span ID filtering**: Only local spans included (prevents "Missing span ID" errors)
 
-This prevents "Missing span ID" errors that occur when logs reference remote parent spans from calling services. Remote spans aren't exported by your service, so Cloud Trace can't find them.
+The implementation uses `span_context.is_remote()` to distinguish between local middleware spans and remote parent spans from other services.
 
 ### 4. Critical: Layer Ordering
 
@@ -302,18 +318,20 @@ cargo test --features opentelemetry
 
 5. **Context Propagation**: 
    - **Trace IDs**: Extracted from builder OR parent context (enables distributed tracing)
-   - **Span IDs**: Extracted from builder ONLY (prevents "Missing span ID" errors)
+   - **Span IDs**: Extracted from builder OR local parent context (includes local middleware, excludes remote services)
    
    This distinction is critical:
    - Trace ID propagation enables cross-service tracing
-   - Span ID isolation ensures only local, exported spans are referenced
+   - Span ID filtering ensures only local, exported spans are referenced
+   - Uses `span_context.is_remote()` to distinguish local vs remote spans
    - Prevents referencing remote parent spans that aren't in your service's trace export
 
 6. **Span ID Behavior**:
-   - Only `otel_data.builder.span_id` is used (local spans only)
-   - Remote parent span IDs are intentionally NOT included
-   - This prevents "Missing span ID" errors in Cloud Trace
-   - Your logs will only reference spans that your service actually exports
+   - Builder span ID is checked first (current span)
+   - Falls back to parent context span ID IF `!span_context.is_remote()` (local parent spans)
+   - Remote parent span IDs are intentionally excluded
+   - This prevents "Missing span ID" errors for cross-service calls
+   - Local middleware spans (e.g., Poem HTTP spans) ARE included
 
 ## Troubleshooting
 
@@ -334,7 +352,9 @@ If you see "Missing span ID" in Cloud Trace for only some spans, this is **expec
 - `(Missing span ID xyz123)` where `xyz123` is from an upstream service
 - This happens when your service receives requests with trace context from other services
 - The parent span isn't exported by your service, so Cloud Trace can't display it
-- Your service's spans will still appear correctly in the trace hierarchy
+- Your service's spans (including local middleware) will still appear correctly in the trace hierarchy
+- Local spans like `/new-media-added` (Poem middleware) WILL have span IDs
+- Only the cross-service boundary span will show as missing
 
 **Actual problem (needs fixing):**
 - Your own service's spans showing as missing
@@ -429,5 +449,7 @@ If you're seeing "Missing span ID" errors:
 4. ✅ **Span context**: Are you creating and entering spans with `tracing::span!`?
 5. ✅ **Log output**: Do logs contain `logging.googleapis.com/spanId` field?
 
-If all local spans show as missing → **Layer order is wrong**  
-If only root/parent spans show as missing → **Expected for remote parent spans**
+**Interpreting results:**
+- All local spans missing (including middleware) → **Layer order is wrong**
+- Only cross-service boundary span missing → **Expected for remote parent spans**
+- Middleware spans like `/api/endpoint` present → **Working correctly**
