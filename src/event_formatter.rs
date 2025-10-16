@@ -247,7 +247,8 @@ impl EventFormatter {
                 // (trace IDs are propagated, not generated per span)
                 let parent_cx = &otel_data.parent_cx;
                 if parent_cx.has_active_span() {
-                    let parent_span_context = parent_cx.span().span_context();
+                    let parent_span = parent_cx.span();
+                    let parent_span_context = parent_span.span_context();
                     otel_trace_id = Some(format!(
                         "projects/{}/traces/{}",
                         config.project_id,
@@ -282,7 +283,8 @@ impl EventFormatter {
 
                 let current_cx = opentelemetry::Context::current();
                 if current_cx.has_active_span() {
-                    let current_span_context = current_cx.span().span_context();
+                    let current_span = current_cx.span();
+                    let current_span_context = current_span.span_context();
                     if !current_span_context.is_remote() {
                         if otel_trace_id.is_none() {
                             otel_trace_id = Some(format!(
