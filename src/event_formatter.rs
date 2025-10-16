@@ -243,7 +243,7 @@ impl EventFormatter {
                 .extensions()
                 .get::<tracing_opentelemetry::OtelData>()
             {
-                // Use parent_cx as it reflects the context when span was created
+                // Get trace ID from parent_cx for distributed tracing
                 let otel_ctx = &otel_data.parent_cx;
                 if otel_ctx.has_active_span() {
                     let otel_span_ref = otel_ctx.span();
@@ -254,8 +254,20 @@ impl EventFormatter {
                         config.project_id,
                         otel_span_context.trace_id()
                     ));
-                    otel_span_id = Some(otel_span_context.span_id().to_string());
                     otel_is_sampled = Some(otel_span_context.is_sampled());
+                }
+
+                // Get span ID: try builder first (current span), then parent_cx only if not remote
+                if let Some(span_id) = otel_data.builder.span_id {
+                    // Use the current span's ID from builder
+                    otel_span_id = Some(span_id.to_string());
+                } else if otel_ctx.has_active_span() {
+                    let otel_span_ref = otel_ctx.span();
+                    let otel_span_context = otel_span_ref.span_context();
+                    // Only use parent span ID if it's not from a remote service
+                    if !otel_span_context.is_remote() {
+                        otel_span_id = Some(otel_span_context.span_id().to_string());
+                    }
                 }
             }
 
